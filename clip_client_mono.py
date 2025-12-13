@@ -61,12 +61,12 @@ for start in tqdm(range(0, N_SAMPLES, BATCH_SIZE)):
     out = resp.json()
     t1 = time.perf_counter()
 
-    dt = t1 - t0
+    request_time = t1 - t0
     n_requests += 1
-    req_latencies_s.append(dt)
+    req_latencies_s.append(request_time)
 
-    bsz = len(images)
-    img_latencies_s.append(dt / max(bsz, 1))
+    actual_bsize = len(images)
+    img_latencies_s.append(request_time / max(actual_bsize, 1))
 
     image_embeds = np.asarray(out["image_embeds"])
     text_embeds = np.asarray(out["text_embeds"])
