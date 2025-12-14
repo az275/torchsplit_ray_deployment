@@ -1,12 +1,14 @@
 import asyncio
 import aiohttp
 import base64
+import csv
 import io
 import os
 import time
 import statistics
 import requests
 import numpy as np
+from pathlib import Path
 from PIL import Image
 from datasets import load_dataset
 from tqdm import tqdm
@@ -14,6 +16,27 @@ from tqdm import tqdm
 SERVE_URL = "http://127.0.0.1:8000/"
 
 os.environ["HF_DATASETS_CACHE"] = "/dev/shm/hf_datasets_cache"
+
+# write stats
+DATA_DIR = Path("./data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+SUMMARY_PATH = DATA_DIR / "runtime_summary.csv"
+
+if not SUMMARY_PATH.exists():
+    with open(SUMMARY_PATH, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "qps_target",
+            "duration_s",
+            "expected_requests",
+            "completed_requests",
+            "success_rate",
+            "achieved_qps",
+            "p50_s",
+            "p90_s",
+            "p99_s",
+        ])
 
 def pil_to_base64(img: Image.Image) -> str:
     buf = io.BytesIO()
@@ -111,6 +134,7 @@ async def main():
         print(f"\nRunning {qps} QPS for {duration}s...")
         results = await run_qps_stage(qps, duration, payloads)
 
+        # compute metrics
         latencies = [r["latency"] for r in results if r["latency"] is not None]
         n_ok = sum(1 for r in results if r["ok"])
         n_total = len(results)
@@ -133,6 +157,33 @@ async def main():
         print(f"  expected≈{expected}, completed={actual}, wall={total_time:.3f}s")
         print(f"  achieved_qps={achieved_qps:.2f}, success_qps={success_qps:.2f}, success={success_rate:.2%}")
         print(f"  p50={p50:.3f}s  p90={p90:.3f}s  p99={p99:.3f}s")
+
+        # write stats
+        results_path = DATA_DIR / f"results_qps_{qps}.csv"
+        with open(results_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["latency_s", "ok", "start", "end"])
+            for r in results:
+                writer.writerow([
+                    r["latency"],
+                    r["ok"],
+                    r["start"],
+                    r["end"],
+                ])
+
+        with open(SUMMARY_PATH, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                qps,
+                duration,
+                expected,
+                actual,
+                success_rate,
+                achieved_qps,
+                p50,
+                p90,
+                p99,
+            ])
 
 
 if __name__ == "__main__":
