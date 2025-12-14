@@ -1,3 +1,5 @@
+import asyncio
+import aiohttp
 import base64
 import io
 import os
@@ -18,76 +20,120 @@ def pil_to_base64(img: Image.Image) -> str:
     img.save(buf, format="JPEG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-def food101_prompts(classes):
-    return [f"a photo of {cls.replace('_', ' ')} food" for cls in classes]
+def food101_prompt(label: int, label_names) -> str:
+    return f"a photo of {label_names[label].replace('_', ' ')}"
 
 dataset = load_dataset(
     "ethz/food101",
     split="validation",
 )
+label_names = dataset.features["label"].names
 
-N_SAMPLES = 32
-BATCH_SIZE = 1
+NUM_SAMPLES=10500
 
-dataset = dataset.select(range(N_SAMPLES))
+def prepare_payloads():
+    payloads = []
+    for i in range(NUM_SAMPLES):
+        item = dataset[i]
+        try:
+            payloads.append(
+                {
+                    "image": pil_to_base64(item["image"]),
+                    "text": food101_prompt(int(item["label"]), label_names),
+                }
+            )
+        except Exception:
+            print("encode failed")
+            continue
+    return payloads
 
-class_names = dataset.features["label"].names
-text_prompts = food101_prompts(class_names)
 
-print(f"Running CLIP inference on {N_SAMPLES} samples (batch_size={BATCH_SIZE})")
+async def send_request(session, payload, sem, results):
+    async with sem:
+        start = time.perf_counter()
+        try:
+            async with session.post(SERVE_URL, json=payload) as resp:
+                await resp.read()
+                end = time.perf_counter()
+                latency = end - start
+                results.append(
+                    {
+                        "latency": latency,
+                        "ok": resp.status == 200,
+                        "start": start,
+                        "end": end
+                    }
+                )
+        except Exception:
+            end = time.perf_counter()
+            results.append({"latency": None, "ok": False, "start": start, "end": end})
 
-req_latencies_s = []
-img_latencies_s = []
-t0_all = time.perf_counter()
-n_requests = 0
 
-for start in tqdm(range(0, N_SAMPLES, BATCH_SIZE)):
-    batch = dataset[start : start + BATCH_SIZE]
+async def run_qps_stage(qps, duration, payloads, max_in_flight=1024):
+    results = []
+    sem = asyncio.Semaphore(max_in_flight)
 
-    images = [pil_to_base64(img) for img in batch["image"]]
-    labels = batch["label"]
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+        end_time = start_time + duration
+        interval = 1.0 / qps
 
-    payload = {
-        "images": images,
-        "texts": text_prompts,
-    }
+        next_fire = start_time
+        idx = 0
+        tasks = []
 
-    t0 = time.perf_counter()
-    resp = requests.post(SERVE_URL, json=payload, timeout=120)
-    resp.raise_for_status()
-    out = resp.json()
-    t1 = time.perf_counter()
+        while next_fire < end_time:
+            # wait until scheduled fire time
+            await asyncio.sleep(max(0, next_fire - loop.time()))
 
-    request_time = t1 - t0
-    n_requests += 1
-    req_latencies_s.append(request_time)
+            payload = payloads[idx % len(payloads)]
+            tasks.append(asyncio.create_task(send_request(session, payload, sem, results)))
 
-    actual_bsize = len(images)
-    img_latencies_s.append(request_time / max(actual_bsize, 1))
+            idx += 1
+            next_fire += interval
 
-    print(out)
+        await asyncio.gather(*tasks)
 
-t1_all = time.perf_counter()
-elapsed_s = t1_all - t0_all
+    return results
 
-throughput_img_s = N_SAMPLES / elapsed_s
-throughput_req_s = n_requests / elapsed_s
 
-def pct(values, p):
-    arr = np.asarray(values, dtype=np.float64)
-    return float(np.percentile(arr, p))
+async def main():
+    print("Pre-generating payloads...")
+    payloads = prepare_payloads()
+    print(f"Prepared {NUM_SAMPLES} payloads")
 
-if req_latencies_s:
-    avg_req_ms = statistics.mean(req_latencies_s) * 1e3
-    avg_img_ms = statistics.mean(img_latencies_s) * 1e3
+    qps_schedule = [128, 256, 512, 1024, 2048]
+    duration = 5
 
-    print("\n--- Performance (client-side end-to-end) ---")
-    print(f"Total wall time: {elapsed_s:.3f} s")
-    print(f"Requests: {n_requests}, Images: {N_SAMPLES}")
-    print(f"Throughput: {throughput_img_s:.2f} images/s  |  {throughput_req_s:.2f} req/s")
-    print(f"Avg latency: {avg_req_ms:.2f} ms/request  |  {avg_img_ms:.2f} ms/image (req_latency/batch)")
+    for qps in qps_schedule:
+        print(f"\nRunning {qps} QPS for {duration}s...")
+        results = await run_qps_stage(qps, duration, payloads)
 
-    print("Request latency percentiles (ms): "
-          f"p50={pct(req_latencies_s, 50)*1e3:.2f}, "
-          f"p90={pct(req_latencies_s, 90)*1e3:.2f}, "
-          f"p99={pct(req_latencies_s, 99)*1e3:.2f}")
+        latencies = [r["latency"] for r in results if r["latency"] is not None]
+        n_ok = sum(1 for r in results if r["ok"])
+        n_total = len(results)
+
+        start_all = min(r["start"] for r in results)
+        end_all = max(r["end"] for r in results)
+        total_time = end_all - start_all
+
+        achieved_qps = n_total / total_time
+        success_qps = n_ok / total_time
+        success_rate = n_ok / n_total
+
+        expected = qps * duration
+        actual = n_total
+
+        p50 = statistics.median(latencies)
+        p90 = np.percentile(latencies, 90)
+        p99 = np.percentile(latencies, 99)
+
+        print(f"  expected≈{expected}, completed={actual}, wall={total_time:.3f}s")
+        print(f"  achieved_qps={achieved_qps:.2f}, success_qps={success_qps:.2f}, success={success_rate:.2%}")
+        print(f"  p50={p50:.3f}s  p90={p90:.3f}s  p99={p99:.3f}s")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
